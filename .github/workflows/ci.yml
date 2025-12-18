@@ -1,0 +1,232 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+  release:
+    types: [created]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-linux-gnu
+            name: linux-x86_64-glibc
+          - target: x86_64-linux-musl
+            name: linux-x86_64-musl
+          - target: aarch64-linux-gnu
+            name: linux-aarch64-glibc
+          - target: aarch64-linux-musl
+            name: linux-aarch64-musl
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: master
+
+      - name: Get version
+        id: version
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+          else
+            echo "version=0.0.0-$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }} -Dversion=${{ steps.version.outputs.version }} -Dgit-commit=$(git rev-parse --short HEAD)
+
+      - name: Strip binary
+        run: |
+          if [[ "${{ matrix.target }}" == x86_64* ]]; then
+            strip zig-out/bin/poof
+          elif [[ "${{ matrix.target }}" == aarch64* ]]; then
+            sudo apt-get update && sudo apt-get install -y binutils-aarch64-linux-gnu
+            aarch64-linux-gnu-strip zig-out/bin/poof || true
+          fi
+
+      - name: Rename binary
+        run: mv zig-out/bin/poof poof-${{ matrix.name }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: poof-${{ matrix.name }}
+          path: poof-${{ matrix.name }}
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: master
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Build
+        run: zig build
+
+      - name: Run tests
+        run: sudo -E env "PATH=$PATH" bun test
+
+  package:
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Get version
+        id: version
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+          else
+            echo "version=0.0.0-$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build .deb packages
+        run: ./scripts/build-deb.sh "${{ steps.version.outputs.version }}" artifacts .
+
+      - name: Build Arch package
+        run: ./scripts/build-arch.sh "${{ steps.version.outputs.version }}" artifacts .
+
+      - name: Upload deb amd64
+        uses: actions/upload-artifact@v4
+        with:
+          name: poof-deb-amd64
+          path: poof_*_amd64.deb
+
+      - name: Upload deb arm64
+        uses: actions/upload-artifact@v4
+        with:
+          name: poof-deb-arm64
+          path: poof_*_arm64.deb
+
+      - name: Upload Arch package
+        uses: actions/upload-artifact@v4
+        with:
+          name: poof-arch-x86_64
+          path: archpkg/poof-*.pkg.tar.xz
+
+  canary:
+    needs: [build, test, package]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name 'poof-*' -o -name '*.deb' -o -name '*.pkg.tar.xz' \) -exec cp {} release/ \;
+          chmod +x release/poof-*
+          ls -la release/
+
+      - name: Update canary release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: canary
+          name: Canary Build
+          prerelease: true
+          files: release/*
+          body: |
+            Automated canary build from `${{ github.ref_name }}` branch.
+
+            **Commit:** ${{ github.sha }}
+
+            ## Installation
+
+            **Debian/Ubuntu:**
+            ```bash
+            curl -LO https://github.com/jarred-sumner/poof/releases/download/canary/poof_0.0.0-${{ github.sha }}_amd64.deb
+            sudo dpkg -i poof_*.deb
+            ```
+
+            **Arch Linux:**
+            ```bash
+            curl -LO https://github.com/jarred-sumner/poof/releases/download/canary/poof-0.0.0_${{ github.sha }}-1-x86_64.pkg.tar.xz
+            sudo pacman -U poof-*.pkg.tar.xz
+            ```
+
+            **Binary:**
+            ```bash
+            curl -L https://github.com/jarred-sumner/poof/releases/download/canary/poof-linux-x86_64-musl -o poof
+            chmod +x poof && sudo mv poof /usr/local/bin/
+            ```
+
+  release:
+    needs: [build, test, package]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name 'poof-*' -o -name '*.deb' -o -name '*.pkg.tar.xz' \) -exec cp {} release/ \;
+          chmod +x release/poof-*
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+
+  # Upload to draft release when created via GitHub UI
+  draft-release:
+    needs: [build, test, package]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name 'poof-*' -o -name '*.deb' -o -name '*.pkg.tar.xz' \) -exec cp {} release/ \;
+          chmod +x release/poof-*
+          ls -la release/
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.release.tag_name }}
+          files: release/*
